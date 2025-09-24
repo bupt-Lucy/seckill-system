@@ -22,7 +22,6 @@ package com.example.seckillsystem.demos.web;
 public class User {
 
     private String name;
-    private String password;
     private Integer age;
 
     public String getName() {

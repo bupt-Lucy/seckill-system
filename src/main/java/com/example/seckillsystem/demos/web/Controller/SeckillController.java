@@ -1,10 +1,7 @@
 package com.example.seckillsystem.demos.web.Controller;
 
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestParam; // 引入这个注解
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 import com.example.seckillsystem.demos.web.Service.SeckillService;
 
@@ -14,7 +11,9 @@ public class SeckillController {
     @Autowired
     private SeckillService seckillService;
 
-    // 修改方法签名，增加一个 @RequestParam
+    /*
+        * 写操作接口，保持不变
+    */
     @PostMapping("/seckill/{productId}")
     public String doSeckill(@PathVariable Long productId,
                             @RequestParam("userId") Long userId) {
@@ -22,4 +21,18 @@ public class SeckillController {
         // 例如，请求的 URL 可能是： /seckill/1?userId=10002
         return seckillService.processSeckill(productId, userId);
     }
+
+    /*
+        * 新增读操作接口
+        * 用于查询商品库存
+    */
+    @GetMapping("/seckill/stock/{productId}")
+    public String checkStock(@PathVariable Long productId) {
+        Integer stock = seckillService.checkStock(productId);
+        if (stock < 0) {
+            return "商品不存在";
+        }
+        return "当前库存为: " + stock;
+    }
+
 }

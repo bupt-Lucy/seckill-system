@@ -5,6 +5,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.TransactionStatus;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,6 +40,8 @@ public class SeckillService {
     private final Lock writeLock = rwLock.writeLock();
     private final Lock readLock = rwLock.readLock();
 
+    private final Semaphore semaphore = new Semaphore(10); // 限制最多10个线程同时访问
+
     /*
         * 新增方法，用于查询商品库存，专门用于处理读请求
         * 使用读写锁中的读锁，允许并发读取，互不堵塞
@@ -65,58 +69,77 @@ public class SeckillService {
      */
     public String processSeckill(Long productId, Long userId) {
         log.info("线程 {} 尝试获取写锁...", Thread.currentThread().getName());
-        writeLock.lock(); // 2. 秒杀操作上写锁，确保互斥
-        log.info("线程 {} 成功获取到写锁", Thread.currentThread().getName());
-        // 3. 定义事务
-        DefaultTransactionDefinition def = new DefaultTransactionDefinition();
-        def.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
-        // 4. 开启事务
-        TransactionStatus status = transactionManager.getTransaction(def);
-
+        // 带超时的尝试获取：在指定时间内获取不到锁就放弃，避免长时间等待
         try {
-            // 所有业务逻辑，和之前一样
-            Optional<Product> productOpt = productRepository.findById(productId);
-            if (!productOpt.isPresent()) {
-                throw new RuntimeException("商品不存在");
+            if (semaphore.tryAcquire(3, TimeUnit.SECONDS)) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                //
+                writeLock.lock(); // 2. 秒杀操作上写锁，确保互斥
+                log.info("线程 {} 成功获取到写锁", Thread.currentThread().getName());
+                // 3. 定义事务
+                DefaultTransactionDefinition def = new DefaultTransactionDefinition();
+                def.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
+                // 4. 开启事务
+                TransactionStatus status = transactionManager.getTransaction(def);
+
+                try {
+                    // 所有业务逻辑，和之前一样
+                    Optional<Product> productOpt = productRepository.findById(productId);
+                    if (!productOpt.isPresent()) {
+                        throw new RuntimeException("商品不存在");
+                    }
+                    Product product = productOpt.get();
+                    Date now = new Date();
+                    if (now.before(product.getStartTime()) || now.after(product.getEndTime())) {
+                        throw new RuntimeException("秒杀未开始或已结束");
+                    }
+
+                    if (orderRepository.findByUserIdAndProductId(userId, productId) != null) {
+                        throw new RuntimeException("您已秒杀过此商品，请勿重复下单");
+                    }
+
+                    if (product.getStock() <= 0) {
+                        throw new RuntimeException("商品已售罄");
+                    }
+
+                    product.setStock(product.getStock() - 1);
+                    productRepository.save(product);
+
+                    SeckillOrder order = new SeckillOrder();
+                    order.setUserId(userId);
+                    order.setProductId(productId);
+                    order.setOrderPrice(product.getPrice());
+                    orderRepository.save(order);
+
+                    // 5. 【关键】在锁释放前，手动提交事务
+                    transactionManager.commit(status);
+                    log.info("线程 {} 秒杀成功，提交事务。", Thread.currentThread().getName());
+
+                    return "秒杀成功！订单创建中...";
+                } catch (Exception e) {
+                    // 6. 如果发生任何异常，手动回滚事务
+                    transactionManager.rollback(status);
+                    log.error("线程 {} 秒杀失败: {}", Thread.currentThread().getName(), e.getMessage());
+                    // 将异常信息返回或记录日志
+                    return e.getMessage();
+                }finally {
+                    // 7. 最后，释放锁
+                    log.info("线程 {} 准备释放写锁.", Thread.currentThread().getName());
+                    writeLock.unlock();
+                    semaphore.release();
+                }
             }
-            Product product = productOpt.get();
-            Date now = new Date();
-            if (now.before(product.getStartTime()) || now.after(product.getEndTime())) {
-                throw new RuntimeException("秒杀未开始或已结束");
+            else {
+                return "申请许可失败，系统繁忙，请稍后再试";
             }
 
-            if (orderRepository.findByUserIdAndProductId(userId, productId) != null) {
-                throw new RuntimeException("您已秒杀过此商品，请勿重复下单");
-            }
-
-            if (product.getStock() <= 0) {
-                throw new RuntimeException("商品已售罄");
-            }
-
-            product.setStock(product.getStock() - 1);
-            productRepository.save(product);
-
-            SeckillOrder order = new SeckillOrder();
-            order.setUserId(userId);
-            order.setProductId(productId);
-            order.setOrderPrice(product.getPrice());
-            orderRepository.save(order);
-
-            // 5. 【关键】在锁释放前，手动提交事务
-            transactionManager.commit(status);
-            log.info("线程 {} 秒杀成功，提交事务。", Thread.currentThread().getName());
-
-            return "秒杀成功！订单创建中...";
-        } catch (Exception e) {
-            // 6. 如果发生任何异常，手动回滚事务
-            transactionManager.rollback(status);
-            log.error("线程 {} 秒杀失败: {}", Thread.currentThread().getName(), e.getMessage());
-            // 将异常信息返回或记录日志
-            return e.getMessage();
-        } finally {
-            // 7. 最后，释放锁
-            log.info("线程 {} 准备释放写锁.", Thread.currentThread().getName());
-            writeLock.unlock();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return "系统繁忙，请稍后再试";
         }
     }
 

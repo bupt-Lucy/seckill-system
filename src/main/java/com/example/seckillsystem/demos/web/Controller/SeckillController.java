@@ -19,7 +19,7 @@ public class SeckillController {
                             @RequestParam("userId") Long userId) {
         // userId不再是写死的，而是从请求参数中获取
         // 例如，请求的 URL 可能是： /seckill/1?userId=10002
-        return seckillService.processSeckill(productId, userId);
+        return seckillService.submitSeckillOrder(productId, userId);
     }
 
     /*

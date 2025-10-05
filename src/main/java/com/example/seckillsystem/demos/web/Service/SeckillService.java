@@ -1,11 +1,14 @@
 package com.example.seckillsystem.demos.web.Service;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.TransactionStatus;
 
+import java.util.*;
 import java.util.concurrent.*;
 
 import org.slf4j.Logger;
@@ -17,8 +20,6 @@ import com.example.seckillsystem.demos.web.Repository.ProductRepository;
 import com.example.seckillsystem.demos.web.Repository.SeckillOrderRepository;
 import org.springframework.transaction.support.DefaultTransactionDefinition;
 
-import java.util.Date;
-import java.util.Optional;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -39,10 +40,17 @@ public class SeckillService {
     // 【新增】内存售罄标记
     private volatile boolean isSoldOut = false;
 
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private DefaultRedisScript<Long> seckillScript;
+    //一个内存队列来存放成功秒杀的订单信息
+    private final BlockingQueue<SeckillOrder> orderQueue = new LinkedBlockingQueue<>(1000);
+
     // 1. 注入平台事务管理器
     @Autowired
     private PlatformTransactionManager transactionManager;
-    private final Semaphore semaphore = new Semaphore(10); // 限制最多10个线程同时访问
     /*
        * 新的入口方法：负责接收请求并提交到线程池
        * 这个方法会立刻返回，不会等待后台程序执行完毕
@@ -78,15 +86,9 @@ public class SeckillService {
         * 使用读写锁中的读锁，允许并发读取，互不堵塞
      */
     public Integer checkStock(Long productId) {
-        try {
-            Optional<Product> productOpt = productRepository.findById(productId);
-            if (!productOpt.isPresent()) {
-                throw new RuntimeException("商品不存在");
-            }
-            return productOpt.get().getStock();
-        } finally {
-            log.info("线程 {} 准备释放读锁.", Thread.currentThread().getName());
-        }
+        String stockKey = RedisPreheatService.STOCK_KEY + productId;
+        Object stockObj = redisTemplate.opsForValue().get(stockKey);
+        return stockObj != null ? Integer.parseInt(stockObj.toString()) : -1;
     }
 
     /*
@@ -94,76 +96,41 @@ public class SeckillService {
         * 使用写锁，确保同一时刻只有一个线程在处理秒杀请求
      */
     private void processSeckill(Long productId, Long userId) {
-        boolean acquired = false;
-        try {
-            // 1. 先尝试获取许可，这是一个“卫语句”，不成功直接返回
-            acquired = semaphore.tryAcquire(3, TimeUnit.SECONDS);
-            if (!acquired) {
-                log.warn("线程 {} 获取信号量许可超时，放弃秒杀请求。", Thread.currentThread().getName());
-                return;
-            }
+        List<String> keys = Arrays.asList(
+                RedisPreheatService.STOCK_KEY + productId,
+                RedisPreheatService.USER_SET_KEY + productId
+        );
 
-            log.info("线程 {} 成功获取信号量许可，准备执行业务。", Thread.currentThread().getName());
+        // 执行 Lua 脚本
+        Long result = redisTemplate.execute(seckillScript, keys, userId.toString());
 
-
-            // 3. 获取互斥锁，执行必须串行的数据库操作
-            // 将这部分逻辑封装到另一个私有方法中，使代码更清晰
-            executeDbOperationsWithoutLock(productId, userId);
-
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log.error("线程 {} 在等待或许可时被中断。", Thread.currentThread().getName(), e);
-        } catch (Exception e) {
-            // 捕获所有其他可能的异常
-            log.error("处理秒杀时发生未知异常, productId={}, userId={}", productId, userId, e);
-        }
-        finally {
-            // 4. 只有在成功获取了许可的情况下，才释放许可
-            if (acquired) {
-                semaphore.release();
-                log.info("线程 {} 释放信号量许可。", Thread.currentThread().getName());
-            }
-        }
-    }
-
-    // 将所有数据库和锁相关的操作封装起来
-    private void executeDbOperationsWithoutLock(Long productId, Long userId) {
-        // 【移除】不再需要 writeLock.lock()
-        DefaultTransactionDefinition def = new DefaultTransactionDefinition();
-        def.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
-        TransactionStatus status = transactionManager.getTransaction(def);
-        try {
-            // 前置检查（重复下单等）依然可以保留
-            if (orderRepository.findByUserIdAndProductId(userId, productId) != null) {
-                throw new RuntimeException("您已秒杀过此商品，请勿重复下单");
-            }
-
-            // 1. 【核心改动】直接调用原子更新方法扣减库存
-            int result = productRepository.deductStock(productId);
-
-            // 2. 检查结果
-            if (result == 0) {
-                // 如果更新行数为0，说明库存不足
-                isSoldOut = true; // 【优化】设置内存售罄标记
-                throw new RuntimeException("商品已售罄");
-            }
-
-            // 3. 如果扣减成功，才创建订单
+        if(result == 0){
+            log.info("用户 {} 秒杀成功，商品ID: {}", userId, productId);
+            // 秒杀成功，生成订单信息并放入内存队列
+            // 此时订单尚未写入数据库
             Product product = getProduct(productId); // 获取商品信息用于创建订单
             SeckillOrder order = new SeckillOrder();
             order.setUserId(userId);
             order.setProductId(productId);
             order.setOrderPrice(product.getPrice());
-            orderRepository.save(order);
-
-            transactionManager.commit(status);
-            log.info("线程 {} 秒杀成功，提交事务。", Thread.currentThread().getName());
-
-        } catch (Exception e) {
-            transactionManager.rollback(status);
-            log.error("线程 {} 秒杀失败，回滚事务: {}", Thread.currentThread().getName(), e.getMessage());
+            // 将订单放入队列
+            try{
+                orderQueue.put(order);
+                log.info("订单已放入队列，当前队列长度: {}", orderQueue.size());
+            }catch (InterruptedException e){
+                Thread.currentThread().interrupt();
+                log.error("将订单放入队列时被中断: {}", e.getMessage());
+            }
         }
-        // 【移除】不再需要 finally { writeLock.unlock() }
+        else if(result == 2){
+            log.warn("用户 {} 重复秒杀，商品ID: {}", userId, productId);
+        }
+        else if(result == 1){
+            log.warn("用户 {} 秒杀失败，商品ID: {}，库存不足", userId, productId);
+        }
+        else{
+            log.error("Lua脚本执行异常，返回值: {}", result);
+        }
     }
 
     /*
@@ -173,5 +140,9 @@ public class SeckillService {
     private Product getProduct(Long productId) {
         Optional<Product> productOpt = productRepository.findById(productId);
         return productOpt.orElse(null);
+    }
+
+    public BlockingQueue<SeckillOrder> getOrderQueue() {
+        return this.orderQueue;
     }
 }

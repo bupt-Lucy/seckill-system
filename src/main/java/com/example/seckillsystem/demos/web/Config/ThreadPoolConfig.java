@@ -1,4 +1,4 @@
-package com.example.seckillsystem.demos.web;
+package com.example.seckillsystem.demos.web.Config;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;

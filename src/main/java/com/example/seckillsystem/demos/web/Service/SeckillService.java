@@ -1,5 +1,6 @@
 package com.example.seckillsystem.demos.web.Service;
 
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
@@ -33,10 +34,6 @@ public class SeckillService {
 
     @Autowired
     private ProductRepository productRepository;
-
-    @Autowired
-    private SeckillOrderRepository orderRepository;
-
     // 【新增】内存售罄标记
     private volatile boolean isSoldOut = false;
 
@@ -44,9 +41,11 @@ public class SeckillService {
     private RedisTemplate<String, Object> redisTemplate;
 
     @Autowired
+    private RabbitTemplate rabbitTemplate; // 注入 RabbitMQ 的操作模板
+
+    @Autowired
     private DefaultRedisScript<Long> seckillScript;
     //一个内存队列来存放成功秒杀的订单信息
-    private final BlockingQueue<SeckillOrder> orderQueue = new LinkedBlockingQueue<>(1000);
 
     // 1. 注入平台事务管理器
     @Autowired
@@ -114,13 +113,8 @@ public class SeckillService {
             order.setProductId(productId);
             order.setOrderPrice(product.getPrice());
             // 将订单放入队列
-            try{
-                orderQueue.put(order);
-                log.info("订单已放入队列，当前队列长度: {}", orderQueue.size());
-            }catch (InterruptedException e){
-                Thread.currentThread().interrupt();
-                log.error("将订单放入队列时被中断: {}", e.getMessage());
-            }
+            rabbitTemplate.convertAndSend("seckill.order.queue", order);
+
         }
         else if(result == 2){
             log.warn("用户 {} 重复秒杀，商品ID: {}", userId, productId);
@@ -142,7 +136,4 @@ public class SeckillService {
         return productOpt.orElse(null);
     }
 
-    public BlockingQueue<SeckillOrder> getOrderQueue() {
-        return this.orderQueue;
-    }
 }

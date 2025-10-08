@@ -13,11 +13,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.transaction.annotation.Transactional;
 
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
 @Service
 public class OrderConsumerService {
 
-    @Autowired
-    private SeckillService seckillService; // 获取队列所在的Service
+    // 【移除】不再需要 @PostConstruct 和手动创建的 new Thread()
+
+    private static final Logger log = LoggerFactory.getLogger(SeckillService.class);
 
     @Autowired
     private SeckillOrderRepository orderRepository;
@@ -25,51 +30,33 @@ public class OrderConsumerService {
     @Autowired
     private ProductRepository productRepository;
 
-    @Autowired
-    @Lazy
-    private OrderConsumerService self;
-    private static final Logger log = LoggerFactory.getLogger(SeckillService.class);
-
-
-    // 应用启动后，开启一个后台线程来消费订单
-    @PostConstruct
-    private void startConsumer() {
-        new Thread(() -> {
-            while (true) {
-                try {
-                    SeckillOrder order = seckillService.getOrderQueue().take();
-                    // 2. 循环体内部现在只调用这个新的、带事务的方法
-                    self.createOrderInDb(order);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    log.error("订单消费者线程被中断", e);
-                    break;
-                } catch (Exception e) {
-                    // 捕获所有其他可能的异常，防止线程意外终止
-                    log.error("处理订单时发生未知异常", e);
-                }
-            }
-        }).start();
-    }
-
     /**
-     * 3. 【新增】一个公开的、带事务注解的方法，专门用于数据库操作
-     * @param order 从队列中取出的订单信息
+     * 【核心改动】
+     * 使用 @RabbitListener 注解来监听指定的队列
+     * Spring AMQP 会自动为我们处理消息的接收、反序列化等工作
+     * @param order 从队列中接收到的订单对象
      */
-    @Transactional
+    @RabbitListener(queues = "seckill.order.queue")
+    @Transactional // 数据库操作依然需要事务保护
     public void createOrderInDb(SeckillOrder order) {
-        log.info("正在创建订单并扣减MySQL库存: {}", order);
+        try {
+            log.info("从RabbitMQ接收到订单消息，准备创建订单: {}", order);
 
-        // 将所有数据库操作都放在这个方法里
-        orderRepository.save(order);
+            orderRepository.save(order);
 
-        int result = productRepository.deductStock(order.getProductId());
-        if (result == 0) {
-            // 这是一个补偿逻辑，理论上在Redis阶段已经保证了库存充足
-            // 但为了数据最终一致性，如果MySQL库存扣减失败，应抛出异常让事务回滚
-            throw new RuntimeException("MySQL a's stock deduction failed for order: " + order);
+            int result = productRepository.deductStock(order.getProductId());
+            if (result == 0) {
+                throw new RuntimeException("MySQL库存扣减失败，订单回滚: " + order);
+            }
+
+            log.info("数据库订单创建成功");
+        } catch (Exception e) {
+            // 如果发生异常，Spring AMQP 默认会进行重试，
+            // 最终如果还是失败，消息会进入“死信队列”（需要额外配置）
+            // 这里我们先简单地打印错误日志
+            log.error("消费订单消息时发生异常: {}", order, e);
+            // 抛出异常，以便Spring AMQP知道处理失败
+            throw e;
         }
-
-        log.info("数据库订单创建成功");
     }
 }

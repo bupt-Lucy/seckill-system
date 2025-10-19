@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'seckill-app-host'
+    metrics_path: /actuator/prometheus
+    static_configs:
+      # 【核心配置】使用 host.docker.internal 这个特殊的DNS名称来指向你的电脑主机
+      - targets: ['host.docker.internal:8080']

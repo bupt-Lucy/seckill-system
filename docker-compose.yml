@@ -1,0 +1,63 @@
+services:
+  # 服务1: 单个 Redis 实例
+  redis:
+    image: redis:6.2
+    container_name: seckill-redis-single
+    ports:
+      - "6379:6379"
+    networks:
+      - monitor-net
+
+  # 服务2: RabbitMQ
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: seckill-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - monitor-net
+
+  # 服务3: Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - monitor-net
+    # 【新增】为容器添加一条自定义的主机记录
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # 服务4: Grafana
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - monitor-net
+    depends_on:
+      - prometheus
+
+    # 【新增】Nginx 接入层服务
+  nginx:
+    image: nginx:latest
+    container_name: nginx-gateway
+    ports:
+      - "80:80" # 【关键】将主机的80端口映射到Nginx容器，这是新的流量入口
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro # 挂载我们的配置文件
+    networks:
+      - monitor-net # 加入到我们现有的网络中
+    # 【关键】和 Prometheus 一样，为 Nginx 手动“指路”
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+# 定义一个网络，让所有容器可以互相通信
+networks:
+  monitor-net:
+    driver: bridge

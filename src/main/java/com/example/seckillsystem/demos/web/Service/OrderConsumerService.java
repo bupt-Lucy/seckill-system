@@ -1,28 +1,20 @@
 package com.example.seckillsystem.demos.web.Service;
-
 import com.example.seckillsystem.demos.web.Repository.ProductRepository;
 import com.example.seckillsystem.demos.web.Repository.SeckillOrderRepository;
 import com.example.seckillsystem.demos.web.SeckillOrder;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.annotation.Lazy;
-import org.springframework.stereotype.Service;
-import javax.annotation.PostConstruct;
-import java.util.concurrent.BlockingQueue;
-
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.transaction.annotation.Transactional;
-
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class OrderConsumerService {
 
-    // 【移除】不再需要 @PostConstruct 和手动创建的 new Thread()
-
-    private static final Logger log = LoggerFactory.getLogger(SeckillService.class);
+    private static final Logger log = LoggerFactory.getLogger(OrderConsumerService.class);
 
     @Autowired
     private SeckillOrderRepository orderRepository;
@@ -30,33 +22,49 @@ public class OrderConsumerService {
     @Autowired
     private ProductRepository productRepository;
 
+    // 注入自身代理，以解决 AOP 方法自调用的问题
+    @Autowired
+    @Lazy
+    private OrderConsumerService self;
+
     /**
-     * 【核心改动】
-     * 使用 @RabbitListener 注解来监听指定的队列
-     * Spring AMQP 会自动为我们处理消息的接收、反序列化等工作
-     * @param order 从队列中接收到的订单对象
+     * 【第一层：消费者入口 & 熔断层】
+     * 这个方法是 RabbitMQ 消息的直接入口。
+     * 它只负责一件事：提供熔断保护，然后将任务委托给内部的事务方法。
+     * 它本身不带 @Transactional 注解。
      */
     @RabbitListener(queues = "seckill.order.queue")
-    @Transactional // 数据库操作依然需要事务保护
+    @CircuitBreaker(name = "dbWrite", fallbackMethod = "fallbackForCreateOrder")
+    public void receiveOrderMessage(SeckillOrder order) {
+        log.info("从RabbitMQ接收到订单消息，准备进行数据库操作: {}", order);
+        // 【关键】通过 self 代理对象，调用带有 @Transactional 注解的内部方法
+        // 这样可以确保 @Transactional 生效
+        self.createOrderInDb(order);
+    }
+
+    /**
+     * 【第二层：事务与业务逻辑层】
+     * 这个方法现在是一个内部方法，只负责核心的数据库操作。
+     * 它只关心一件事：保证这些操作在一个事务中完成。
+     */
+    @Transactional
     public void createOrderInDb(SeckillOrder order) {
-        try {
-            log.info("从RabbitMQ接收到订单消息，准备创建订单: {}", order);
-
-            orderRepository.save(order);
-
-            int result = productRepository.deductStock(order.getProductId());
-            if (result == 0) {
-                throw new RuntimeException("MySQL库存扣减失败，订单回滚: " + order);
-            }
-
-            log.info("数据库订单创建成功");
-        } catch (Exception e) {
-            // 如果发生异常，Spring AMQP 默认会进行重试，
-            // 最终如果还是失败，消息会进入“死信队列”（需要额外配置）
-            // 这里我们先简单地打印错误日志
-            log.error("消费订单消息时发生异常: {}", order, e);
-            // 抛出异常，以便Spring AMQP知道处理失败
-            throw e;
+        // 内部不再需要 try-catch，让异常自然抛出，以便 @CircuitBreaker 能够捕获
+        log.info("进入事务方法，准备创建订单: {}", order);
+        orderRepository.save(order);
+        int result = productRepository.deductStock(order.getProductId());
+        if (result == 0) {
+            // 抛出异常，让事务回滚
+            throw new RuntimeException("MySQL库存扣减失败，订单回滚: " + order);
         }
+        log.info("数据库订单创建成功，事务即将提交。");
+    }
+
+    /**
+     * 降级方法，保持不变。
+     * 它的方法签名需要与【第一层】的 @CircuitBreaker 所在的方法匹配。
+     */
+    public void fallbackForCreateOrder(SeckillOrder order, Throwable t) {
+        log.error("数据库写入熔断器已打开！执行降级逻辑。 订单: {}, 异常: {}", order, t.getMessage());
     }
 }
